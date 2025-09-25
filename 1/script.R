@@ -309,7 +309,7 @@ plot.cars_report <- function(x, ..., title = NULL, sep = ", ") {
 }
 
 report <- cars_report("CARS.csv", rate = 80)
-print(report)
+# print(report)
 report <- write_step1(report, "cars_step1.txt")
 write.csv(report, "cars_step2_summary.csv")
 png("cars_step3_plot.png", width = 1200, height = 800, res = 150)
