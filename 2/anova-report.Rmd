@@ -1,0 +1,84 @@
+---
+title: "ANOVA-only report"
+output:
+  pdf_document:
+    toc: false
+    number_sections: false
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+  - \usepackage{array}
+  - \usepackage{float}
+  - \usepackage{caption}
+  - \usepackage{xcolor}
+  - \captionsetup{labelfont=bf}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+req_pkgs <- c('dplyr','tibble','purrr','stringr','knitr','kableExtra','broom')
+to_install <- setdiff(req_pkgs, rownames(installed.packages()))
+if (length(to_install) > 0) install.packages(to_install, repos = 'https://cloud.r-project.org')
+library(dplyr); library(tibble); library(purrr); library(stringr); library(knitr); library(kableExtra); library(broom)
+alpha <- 0.010000000000
+```
+
+```{r load, include=FALSE}
+if (file.exists('models.RData')) load('models.RData')
+```
+
+```{r helpers, include=FALSE}
+find_models <- function() {
+  nms <- ls(envir = .GlobalEnv, all.names = FALSE)
+  keep <- nms[sapply(nms, function(nm) {
+    obj <- get(nm, envir = .GlobalEnv)
+    inherits(obj, c('lm','aov','glm'))
+  })]
+  tibble(name = keep) %>%
+    mutate(class = vapply(name, function(nm) paste(class(get(nm)), collapse='/'), ''))
+}
+anova_for_model <- function(fit){
+  if (inherits(fit, 'glm')) as.data.frame(suppressWarnings(anova(fit, test = 'Chisq'))) else as.data.frame(suppressWarnings(anova(fit)))
+}
+parse_p_numeric <- function(x){
+  # Преобразуем возможные строки вида '< 2e-16' в числа
+  if (is.character(x)) {
+    y <- gsub('^<\\s*', '', x, perl = TRUE)
+    suppressWarnings(as.numeric(y))
+  } else {
+    suppressWarnings(as.numeric(x))
+  }
+}
+color_pvals <- function(df, alpha = 0.01){
+  # Ищем p-колонку: Pr(>F), Pr(>Chi), p.value, P-value
+  p_idx <- which(grepl('^Pr\\(', colnames(df)) |
+                  grepl('Pr\\(>F\\)', colnames(df)) |
+                  grepl('Pr\\(>Chi\\)', colnames(df)) |
+                  grepl('(^|\\b)p(\\.|-)?value(\\b|$)', tolower(colnames(df))))
+  if (length(p_idx) == 0) return(list(df = df, has_p = FALSE, p_col = NA_integer_))
+  p_col <- p_idx[1]
+  p_num <- parse_p_numeric(df[[p_col]])
+  formatted <- ifelse(is.na(p_num), '', format.pval(p_num, digits = 4, eps = 1e-16))
+  col_vec <- ifelse(!is.na(p_num) & p_num > alpha, 'red', 'black')
+  df[[p_col]] <- kableExtra::cell_spec(formatted, escape = FALSE, color = col_vec)
+  list(df = df, has_p = TRUE, p_col = p_col)
+}
+```
+
+```{r tables, results='asis'}
+models <- find_models()
+if (nrow(models) > 0) {
+  purrr::walk(models$name, function(nm){
+    fit <- get(nm, inherits = TRUE)
+    tab <- anova_for_model(fit)
+    if (!is.data.frame(tab) || ncol(tab) == 0) return(invisible(NULL))
+    tab <- tibble::rownames_to_column(tab, var = 'Term')
+    colored <- color_pvals(tab, alpha = alpha)
+    kbl(colored$df, booktabs = TRUE, longtable = TRUE, escape = FALSE,
+        caption = paste0('ANOVA: ', nm, ' (', paste(class(fit), collapse='/'), ')')) %>%
+      kable_styling(latex_options = c('repeat_header')) %>%
+      print()
+    cat('\n\n')
+  })
+}
+```
