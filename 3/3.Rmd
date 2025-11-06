@@ -1,0 +1,248 @@
+```{r}
+library(MASS)
+library(pls)
+```
+
+## Загрузка данных (адаптация под CARS.csv)
+
+```{r}
+df <- read.csv('CARS.csv')
+
+target_col <- c("MPG_City")
+numeric_cols <- c("Length","Weight","Wheelbase","Horsepower","Invoice","EngineSize","Cylinders")
+factor_cols  <- c("Origin","Type")
+
+df <- na.omit(df[, c(numeric_cols, factor_cols, target_col)])
+
+
+df$Invoice <- as.numeric(gsub("[\\$,]", "", df$Invoice))
+head(df, n=5)
+```
+
+## Вспомогательные функции модели
+
+```{r helpers}
+.lm_stats <- function(fit) {
+  s <- summary(fit)
+  rss <- sum(residuals(fit)^2)
+  list(
+    r2 = s$r.squared,
+    adj_r2 = s$adj.r.squared,
+    mse = rss / s$df[2],
+    rss = rss,
+    aic = AIC(fit),
+    bic = BIC(fit),
+    coefs = s$coefficients
+  )
+}
+
+.sig_report <- function(coef_table) {
+  if (is.null(coef_table) || nrow(coef_table) == 0) return(list(best = NA_character_, worst = NA_character_))
+  ct <- coef_table
+  rn <- rownames(ct)
+  keep <- rn != "(Intercept)"
+  if (!any(keep)) return(list(best = NA_character_, worst = NA_character_))
+  ct <- ct[keep, , drop = FALSE]
+  rn <- rownames(ct)
+  pvals <- ct[, 4]
+  list(best = rn[which.min(pvals)], worst = rn[which.max(pvals)])
+}
+
+.compute_influence <- function(lm_fit, topN = 3L) {
+  cd <- cooks.distance(lm_fit)
+  dfits <- dffits(lm_fit)
+  o <- order(cd, decreasing = TRUE)
+  topN <- as.integer(max(0, topN))
+  top_idx <- if (topN > 0) o[seq_len(min(topN, length(o)))] else integer(0)
+  list(cooksD = cd, dffits = dfits, top_idx = top_idx)
+}
+
+.collapse_levels_by_tukey <- function(df, target, fac, alpha = 0.05) {
+  f <- df[[fac]]
+  if (!is.factor(f) || nlevels(f) < 2L) return(list(data = df, mapping = setNames(levels(f), levels(f))))
+  a <- aov(reformulate(fac, response = target), data = df)
+  tk <- tryCatch(TukeyHSD(a, which = fac), error = function(e) NULL)
+  if (is.null(tk)) return(list(data = df, mapping = setNames(levels(f), levels(f))))
+  tab <- as.data.frame(tk[[1]])
+  if (nrow(tab) == 0) return(list(data = df, mapping = setNames(levels(f), levels(f))))
+
+  lvls <- levels(f)
+  parent <- seq_along(lvls)
+  find_set <- function(i) { if (parent[i] != i) parent[i] <<- find_set(parent[i]); parent[i] }
+  union_set <- function(i, j) { ri <- find_set(i); rj <- find_set(j); if (ri != rj) parent[rj] <<- ri }
+
+  for (i in seq_len(nrow(tab))) {
+    if (is.na(tab$p.adj[i]) || tab$p.adj[i] >= alpha) {
+      ab <- strsplit(rownames(tab)[i], "-")[[1]]
+      ia <- match(ab[1], lvls); ib <- match(ab[2], lvls)
+      if (!is.na(ia) && !is.na(ib)) union_set(ia, ib)
+    }
+  }
+  reps <- vapply(seq_along(lvls), find_set, integer(1))
+  groups <- split(lvls, reps)
+  group_name <- setNames(vapply(groups, function(v) paste(sort(v), collapse = "_"), character(1)), names(groups))
+  mapping <- setNames(group_name[as.character(reps)], lvls)
+
+  df[[fac]] <- factor(unname(mapping[as.character(f)]))
+  list(data = df, mapping = mapping)
+}
+
+.collapse_both_factors <- function(df, target, factor_cols, alpha = 0.05) {
+  mappings <- list(); out <- df
+  for (fac in factor_cols) {
+    res <- .collapse_levels_by_tukey(out, target, fac, alpha = alpha)
+    out <- res$data; mappings[[fac]] <- res$mapping
+  }
+  list(data = out, mappings = mappings)
+}
+
+.build_formula <- function(target, numeric_cols, factor_cols) {
+  rhs <- c(numeric_cols, factor_cols)
+  as.formula(paste(target, "~", paste(rhs, collapse = " + ")))
+}
+
+.stepwise_with_path <- function(df, target, numeric_cols, factor_cols, direction = "both") {
+  full_formula <- .build_formula(target, numeric_cols, factor_cols)
+  null_formula <- as.formula(paste(target, "~ 1"))
+  full <- lm(full_formula, data = df)
+  null <- lm(null_formula, data = df)
+  st <- stepAIC(object = null, scope = list(lower = null_formula, upper = full_formula),
+                direction = direction, trace = FALSE, k = 2)
+  path_steps <- st$anova
+  terms_current <- character(0)
+  refit_by_terms <- function(tset) if (length(tset) == 0) lm(null_formula, data = df) else
+    lm(as.formula(paste(target, "~", paste(tset, collapse = " + "))), data = df)
+
+  models <- list(); coefs_mat <- list(); crit <- numeric(0)
+  m0 <- refit_by_terms(terms_current)
+  models[[1]] <- m0; coefs_mat[[1]] <- coef(m0); crit[1] <- AIC(m0)
+  if (!is.null(path_steps) && nrow(path_steps) > 0) {
+    for (i in seq_len(nrow(path_steps))) {
+      step_descr <- as.character(path_steps$Step[i])
+      if (startsWith(step_descr, "+ ")) {
+        terms_current <- union(terms_current, trimws(substr(step_descr, 3, nchar(step_descr))))
+      } else if (startsWith(step_descr, "- ")) {
+        terms_current <- setdiff(terms_current, trimws(substr(step_descr, 3, nchar(step_descr))))
+      }
+      m <- refit_by_terms(terms_current)
+      models[[length(models)+1]] <- m
+      coefs_mat[[length(coefs_mat)+1]] <- coef(m)
+      crit <- c(crit, AIC(m))
+    }
+  }
+  list(final = st, path_models = models, path_coefs = coefs_mat, path_crit = crit, criterion = "AIC")
+}
+
+.build_X_matrix <- function(df, numeric_cols, factor_cols) {
+  X_num <- as.matrix(df[, numeric_cols, drop = FALSE])
+  mm <- model.matrix(~ . , data = df[, factor_cols, drop = FALSE])
+  X_fac <- mm[, colnames(mm) != "(Intercept)", drop = FALSE]
+  as.matrix(cbind(X_num, X_fac))
+}
+
+.aic_from_rss <- function(n, rss, k) n * log(rss / n) + 2 * k
+
+.pcr_pls_sweep <- function(df, target, numeric_cols, factor_cols, max_comp = NULL) {
+  y <- df[[target]]
+  X <- .build_X_matrix(df, numeric_cols, factor_cols)
+  Xs <- scale(X, center = TRUE, scale = TRUE)
+  dat <- data.frame(y = y, Xs)
+  p <- ncol(Xs); n <- nrow(Xs)
+  if (is.null(max_comp)) max_comp <- min(p, n - 1L)
+  max_comp <- max(1L, max_comp)
+  aic_pcr <- aic_pls <- rss_pcr <- rss_pls <- numeric(max_comp)
+  for (k in 1:max_comp) {
+    m1 <- pcr(y ~ ., data = dat, ncomp = k, validation = "none", scale = FALSE, center = FALSE)
+    yhat1 <- as.numeric(predict(m1, ncomp = k, newdata = dat))
+    rss1 <- sum((y - yhat1)^2); rss_pcr[k] <- rss1; aic_pcr[k] <- .aic_from_rss(n, rss1, k + 1)
+    m2 <- plsr(y ~ ., data = dat, ncomp = k, validation = "none", scale = FALSE, center = FALSE)
+    yhat2 <- as.numeric(predict(m2, ncomp = k, newdata = dat))
+    rss2 <- sum((y - yhat2)^2); rss_pls[k] <- rss2; aic_pls[k] <- .aic_from_rss(n, rss2, k + 1)
+  }
+  list(max_comp = max_comp, pcr = list(aic = aic_pcr, rss = rss_pcr), pls = list(aic = aic_pls, rss = rss_pls))
+}
+```
+
+## Конвейер для CARS
+
+```{r pipeline}
+
+
+# Шаг 1
+fml1 <- .build_formula("MPG_City", numeric_cols, factor_cols)
+lm1  <- lm(fml1, data = df)
+st1  <- .lm_stats(lm1); sg1 <- .sig_report(st1$coefs)
+
+cat("STEP 1 — Full OLS\n")
+cat(sprintf("R2=%.4f, adjR2=%.4f, MSE=%.4f, AIC=%.2f, BIC=%.2f\n", st1$r2, st1$adj_r2, st1$mse, st1$aic, st1$bic))
+cat("Most sig.:", sg1$best, "\nLeast sig.:", sg1$worst, "\n\n")
+```
+
+### Диагностика и удаление выбросов
+
+```{r influence}
+inf <- .compute_influence(lm1, topN = 3)
+top_idx <- inf$top_idx
+par(mfrow = c(1,2))
+plot(inf$cooksD, ylab = "Cook's D", main = "Cook's distance"); points(top_idx, inf$cooksD[top_idx], pch=19, col="red")
+plot(inf$dffits, ylab = "DFFITS", main = "DFFITS"); points(top_idx, inf$dffits[top_idx], pch=19, col="red")
+
+data2 <- if (length(top_idx) > 0) df[-top_idx, , drop = FALSE] else data1
+lm2 <- lm(fml1, data = data2)
+st2 <- .lm_stats(lm2); sg2 <- .sig_report(st2$coefs)
+
+cat("STEP 2 — OLS after outlier removal\n")
+cat("Dropped idx:", paste(top_idx, collapse = ", "), "\n")
+cat(sprintf("R2=%.4f, adjR2=%.4f, MSE=%.4f, AIC=%.2f, BIC=%.2f\n\n", st2$r2, st2$adj_r2, st2$mse, st2$aic, st2$bic))
+```
+
+### Укрупнение уровней факторов (Tukey HSD)
+
+```{r tukey}
+grp <- .collapse_both_factors(data2, "MPG_City", factor_cols, alpha = 0.05)
+data3 <- grp$data
+for (fac in names(grp$mappings)) {
+  mp <- grp$mappings[[fac]]
+  grps <- split(names(mp), unname(mp))
+  cat(sprintf("Grouping for %s:\n", fac))
+  for (g in names(grps)) cat("  ", paste(grps[[g]], collapse = ", "), " -> ", g, "\n", sep = "")
+}
+
+lm3 <- lm(fml1, data = data3)
+st3 <- .lm_stats(lm3); sg3 <- .sig_report(st3$coefs)
+
+cat("\nSTEP 3 — OLS after factor collapsing\n")
+cat(sprintf("R2=%.4f, adjR2=%.4f, MSE=%.4f, AIC=%.2f, BIC=%.2f\n\n", st3$r2, st3$adj_r2, st3$mse, st3$aic, st3$bic))
+```
+
+### Шаговый отбор (AIC) + трасса коэффициентов
+
+```{r stepwise}
+sw <- .stepwise_with_path(data3, "MPG_City", numeric_cols, factor_cols, direction = "both")
+lm4 <- sw$final; st4 <- .lm_stats(lm4); sg4 <- .sig_report(st4$coefs)
+cat("STEP 4 — Stepwise AIC final\n")
+cat(sprintf("R2=%.4f, adjR2=%.4f, MSE=%.4f, AIC=%.2f, BIC=%.2f\n\n", st4$r2, st4$adj_r2, st4$mse, st4$aic, st4$bic))
+
+# Трасса коэффициентов + AIC по шагам
+all_coef_names <- unique(unlist(lapply(sw$path_coefs, names)))
+coef_mat <- do.call(rbind, lapply(sw$path_coefs, function(v) { out <- setNames(rep(NA_real_, length(all_coef_names)), all_coef_names); out[names(v)] <- v; out }))
+par(mfrow = c(1,2))
+matplot(coef_mat, type = "l", lty = 1, lwd = 1.2, main = "Coefficient paths", xlab = "Step", ylab = "Coef")
+legend("topright", legend = colnames(coef_mat), lty = 1, cex = 0.7, bty = "n")
+plot(seq_along(sw$path_crit), sw$path_crit, type = "b", xlab = "Step", ylab = sw$criterion, main = "AIC along path")
+```
+
+### PCR / PLS
+
+```{r pcr-pls}
+sweep <- .pcr_pls_sweep(data3, "MPG_City", numeric_cols, factor_cols)
+k <- 1:sweep$max_comp
+par(mfrow = c(1,2))
+plot(k, sweep$pcr$aic, type = "b", xlab = "# components", ylab = "AIC", main = "PCR AIC")
+plot(k, sweep$pls$aic, type = "b", xlab = "# components", ylab = "AIC", main = "PLS AIC")
+
+best_pcr_k <- which.min(sweep$pcr$aic)
+best_pls_k <- which.min(sweep$pls$aic)
+best_method <- if (min(sweep$pcr$aic) <= min(sweep$pls$aic)) sprintf("PCR (k=%d)", best_pcr_k) else sprintf("PLS (k=%d)", best_pls_k)
+cat("STEP 5 — Best low-rank method:", best_method, "\n")
+```
